@@ -2,16 +2,24 @@ import streamlit as st
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 from langchain.text_splitter import CharacterTextSplitter
+from langchain.embeddings import HuggingFaceInstructEmbeddings
+from sentence_transformers import SentenceTransformer
 from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.vectorstores import FAISS
 from langchain.vectorstores import FAISS
 from langchain.chat_models import ChatOpenAI
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 from langchain.llms import HuggingFaceHub
+from htmlTemplates import css, bot_template, user_template
 import time
-import base64
+import pytesseract
+from PIL import Image
 import speech_recognition as sr
 import os
+import hashlib
+import base64
+import json
 
 # Helper Functions
 def get_pdf_text(pdf_docs):
@@ -36,21 +44,54 @@ def get_text_chunks(text):
 
 def get_vectorstore(text_chunks):
     """Create a vector store from text chunks using sentence-transformers embeddings."""
-    model_name = "sentence-transformers/all-MiniLM-L6-v2"
+    # Load a SentenceTransformer model
+    model_name = "sentence-transformers/all-MiniLM-L6-v2"  # Lightweight and effective
     embeddings = HuggingFaceEmbeddings(model_name=model_name)
+    
+    # Create the FAISS vectorstore
     vectorstore = FAISS.from_texts(texts=text_chunks, embedding=embeddings)
     return vectorstore
 
+
 def get_conversation_chain(vectorstore):
-    """Set up the conversational chain."""
+    """Set up the conversational chain with a retry mechanism."""
     llm = HuggingFaceHub(repo_id="google/flan-t5-base", model_kwargs={"temperature": 0.3, "max_length": 512})
     memory = ConversationBufferMemory(memory_key='chat_history', return_messages=True)
-    conversation_chain = ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=vectorstore.as_retriever(),
-        memory=memory
-    )
-    return conversation_chain
+    attempts = 3
+
+    for attempt in range(attempts):
+        try:
+            conversation_chain = ConversationalRetrievalChain.from_llm(
+                llm=llm,
+                retriever=vectorstore.as_retriever(),
+                memory=memory
+            )
+            return conversation_chain
+        except Exception as e:
+            st.error(f"Attempt {attempt + 1}: Failed to create conversation chain: {e}")
+            if attempt < attempts - 1:
+                time.sleep(5)  # Retry after a delay
+    return None  # Return None if all attempts fail
+
+def get_pdf_metadata(pdf_docs):
+    """Extract metadata from the uploaded PDFs."""
+    metadata = []
+    for pdf in pdf_docs:
+        pdf_reader = PdfReader(pdf)
+        meta = pdf_reader.metadata
+        metadata.append({
+            'Author': meta.get('/Author', 'Unknown'),
+            'CreationDate': meta.get('/CreationDate', 'Unknown'),
+            'Title': meta.get('/Title', 'Unknown')
+        })
+    return metadata
+
+# New Features
+def summarize_text(text, model="t5-small"):
+    """Summarize text using a model."""
+    summarizer = HuggingFaceHub(repo_id=model)
+    summary = summarizer(text)
+    return summary
 
 def download_chat_history(chat_history):
     """Download chat history as a text file."""
@@ -65,64 +106,16 @@ def download_chat_history(chat_history):
     href = f'<a href="data:text/plain;base64,{b64}" download="chat_history.txt">Download Chat History</a>'
     st.markdown(href, unsafe_allow_html=True)
 
-def audio_to_text():
-    """Capture audio input and convert to text."""
-    recognizer = sr.Recognizer()
-    microphone = sr.Microphone()
-    st.info("Listening... Speak into your microphone.")
-    try:
-        with microphone as source:
-            recognizer.adjust_for_ambient_noise(source)
-            audio = recognizer.listen(source, timeout=5)
-            text = recognizer.recognize_google(audio)
-            st.success(f"You said: {text}")
-            return text
-    except sr.UnknownValueError:
-        st.error("Sorry, I could not understand your speech.")
-        return None
-    except sr.RequestError as e:
-        st.error(f"Error with the speech recognition service: {e}")
-        return None
-
-# User Authentication
-def user_authentication():
-    if "user_authenticated" not in st.session_state:
-        st.session_state.user_authenticated = False
-
-    if not st.session_state.user_authenticated:
-        st.sidebar.subheader("Login / Signup")
-        username = st.sidebar.text_input("Username")
-        password = st.sidebar.text_input("Password", type="password")
-        choice = st.sidebar.radio("Action", ["Login", "Signup"])
-
-        if st.sidebar.button("Submit"):
-            if choice == "Signup":
-                # Add logic to save new user credentials
-                st.session_state.user_authenticated = True
-                st.success("Signup successful. You're now logged in!")
-            elif choice == "Login":
-                # Add logic to validate credentials
-                st.session_state.user_authenticated = True
-                st.success("Login successful!")
-            else:
-                st.error("Invalid credentials!")
-    else:
-        st.sidebar.success("You're logged in!")
-        if st.sidebar.button("Logout"):
-            st.session_state.user_authenticated = False
-
 # Main Function
 def main():
     load_dotenv()
     st.set_page_config(page_title="Enhanced PDF Chat", page_icon=":books:")
+    st.write(css, unsafe_allow_html=True)
+
     if "conversation" not in st.session_state:
         st.session_state.conversation = None
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = None
-
-    user_authentication()
-    if not st.session_state.user_authenticated:
-        st.stop()
 
     st.header("Chat with Multiple PDFs :books:")
     st.subheader("1. Upload PDFs in the sidebar")
@@ -132,29 +125,54 @@ def main():
     with st.sidebar:
         st.subheader("Upload Your Documents")
         pdf_docs = st.file_uploader("Upload PDFs", accept_multiple_files=True)
-        if st.button("Process PDFs") and pdf_docs:
+        
+        # Display metadata
+        if pdf_docs:
+            metadata = get_pdf_metadata(pdf_docs)
+            st.write("**PDF Metadata**")
+            st.write(metadata)
+
+        process_pages = st.text_input("Specify pages to process (e.g., 1,2,5-10)")
+        if st.button("Process PDFs"):
             with st.spinner("Processing..."):
-                raw_text = get_pdf_text(pdf_docs)
-                text_chunks = get_text_chunks(raw_text)
-                vectorstore = get_vectorstore(text_chunks)
-                st.session_state.conversation = get_conversation_chain(vectorstore)
-                if st.session_state.conversation:
-                    st.success("Conversation chain successfully initialized!")
+                try:
+                    if process_pages:
+                        pages = [int(p) - 1 for p in process_pages.split(",")]
+                        raw_text = process_selected_pages(pdf_docs[0], pages)  # Process only the first PDF for now
+                    else:
+                        raw_text = get_pdf_text(pdf_docs)
+                    
+                    # Summarize text
+                    st.write("**Summarizing Document...**")
+                    summary = summarize_text(raw_text)
+                    st.write(summary)
+
+                    # Prepare conversation
+                    text_chunks = get_text_chunks(raw_text)
+                    vectorstore = get_vectorstore(text_chunks)
+                    st.session_state.conversation = get_conversation_chain(vectorstore)
+
+                    if st.session_state.conversation:
+                        st.success("Conversation chain successfully initialized!")
+                    else:
+                        st.error("Failed to initialize the conversation chain. Please try again.")
+                except Exception as e:
+                    st.error(f"Error processing PDFs: {e}")
 
     # Chat Interface
     user_question = st.text_input("Ask a question:")
-    if st.button("Use Audio Input"):
-        audio_input = audio_to_text()
-        if audio_input:
-            user_question = audio_input
-
     if user_question:
         if st.session_state.conversation:
-            response = st.session_state.conversation({'question': user_question})
-            st.session_state.chat_history = response['chat_history']
-            for i, message in enumerate(st.session_state.chat_history):
-                role = "User" if i % 2 == 0 else "Bot"
-                st.markdown(f"**{role}:** {message.content}")
+            try:
+                response = st.session_state.conversation({'question': user_question})
+                st.session_state.chat_history = response['chat_history']
+                for i, message in enumerate(st.session_state.chat_history):
+                    if i % 2 == 0:
+                        st.write(user_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
+                    else:
+                        st.write(bot_template.replace("{{MSG}}", message.content), unsafe_allow_html=True)
+            except Exception as e:
+                st.error(f"Error in conversation: {e}")
         else:
             st.error("Please upload and process a document to start the chat.")
 
