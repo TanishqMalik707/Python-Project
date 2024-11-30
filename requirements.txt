@@ -3,7 +3,6 @@ langchain
 PyPDF2
 sentence-transformers
 huggingface-hub
-pyaudio
 speechrecognition
 python-dotenv
 faiss-cpu
