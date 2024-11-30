@@ -1,5 +1,6 @@
 streamlit
 langchain
+langchain-community
 PyPDF2
 sentence-transformers
 huggingface-hub
