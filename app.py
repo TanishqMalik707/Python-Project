@@ -182,4 +182,4 @@ def main():
         download_chat_history(st.session_state.chat_history)
 
 if __name__ == '__main__':
-    main(
+    main()
